@@ -20,7 +20,7 @@ path = "src/main.rs"
 demo = ["maki-ui/demo"]
 
 [dependencies]
-maki-ui = { path = "maki-ui" }
+maki-ui = { workspace = true }
 maki-agent = { workspace = true }
 maki-code-index = { workspace = true }
 maki-config = { workspace = true }
@@ -63,15 +63,15 @@ repository = "https://github.com/tontinton/maki"
 rust-version = "1.85"
 
 [workspace.dependencies]
-maki-agent = { path = "maki-agent" }
-maki-config = { path = "maki-config" }
-maki-code-index = { path = "maki-code-index" }
-maki-interpreter = { path = "maki-interpreter" }
-maki-providers = { path = "maki-providers" }
-maki-storage = { path = "maki-storage" }
-maki-ui = { path = "maki-ui" }
-maki-tool-macro = { path = "maki-tool-macro" }
-maki-config-macro = { path = "maki-config-macro" }
+maki-agent = { path = "maki-agent", version = "0.1.0" }
+maki-config = { path = "maki-config", version = "0.1.0" }
+maki-code-index = { path = "maki-code-index", version = "0.1.0" }
+maki-interpreter = { path = "maki-interpreter", version = "0.1.0" }
+maki-providers = { path = "maki-providers", version = "0.1.0" }
+maki-storage = { path = "maki-storage", version = "0.1.0" }
+maki-ui = { path = "maki-ui", version = "0.1.0" }
+maki-tool-macro = { path = "maki-tool-macro", version = "0.1.0" }
+maki-config-macro = { path = "maki-config-macro", version = "0.1.0" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 uuid = { version = "1", default-features = false, features = ["v4"] }
