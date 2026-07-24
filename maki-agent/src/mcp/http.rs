@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use super::error::McpError;
 use super::oauth;
-use super::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use super::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use super::transport::{BoxFuture, McpTransport};
 use tracing::{info, warn};
 
@@ -154,16 +154,11 @@ impl HttpTransport {
     }
 
     fn parse_rpc_response(&self, body_str: &str, is_sse: bool, id: u64) -> Result<Value, McpError> {
-        let events = if is_sse {
-            parse_sse_events(body_str)
-        } else {
-            vec![
-                serde_json::from_str(body_str).map_err(|e| McpError::InvalidResponse {
-                    server: self.server(),
-                    reason: e.to_string(),
-                })?,
-            ]
-        };
+        if !is_sse {
+            return self.parse_json_response(body_str, id);
+        }
+
+        let events = parse_sse_events(body_str);
 
         let rpc_value = events
             .into_iter()
@@ -188,6 +183,52 @@ impl HttpTransport {
         }
 
         Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    fn parse_json_response(&self, body_str: &str, id: u64) -> Result<Value, McpError> {
+        let body: Value = serde_json::from_str(body_str).map_err(|e| McpError::InvalidResponse {
+            server: self.server(),
+            reason: e.to_string(),
+        })?;
+
+        let messages = match body {
+            Value::Array(items) => items,
+            single => vec![single],
+        };
+
+        for msg in messages {
+            if msg.get("method").is_some() {
+                continue;
+            }
+
+            let msg_id = msg.get("id").and_then(Value::as_u64);
+
+            if let Some(err) = msg.get("error") {
+                if msg_id == Some(id) || msg_id.is_none() {
+                    let err: JsonRpcError = serde_json::from_value(err.clone()).map_err(|e| {
+                        McpError::InvalidResponse {
+                            server: self.server(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    return Err(McpError::RpcError {
+                        server: self.server(),
+                        code: err.code,
+                        message: err.message,
+                    });
+                }
+                continue;
+            }
+
+            if msg_id == Some(id) {
+                return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+            }
+        }
+
+        Err(McpError::InvalidResponse {
+            server: self.server(),
+            reason: format!("no response matching request id {id}"),
+        })
     }
 
     /// Single-flight token refresh after a 401. Holds the `auth` lock across the
@@ -361,8 +402,8 @@ impl McpTransport for HttpTransport {
     }
 }
 
-/// A null or missing id only counts for errors: that is what JSON-RPC sends
-/// back when it could not parse the request itself.
+/// SSE only: a null or missing id only counts for errors: that is what
+/// JSON-RPC sends back when it could not parse the request itself.
 fn is_response_to(event: &Value, id: u64) -> bool {
     match event.get("id").and_then(Value::as_u64) {
         Some(event_id) => {
@@ -427,6 +468,11 @@ mod tests {
     const STALE_RESPONSE_EVENT: &str =
         "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stale\":true}}\n\n";
     const NULL_ID_ERROR_EVENT: &str = "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse error\"}}\n\n";
+    const JSON_NULL_ID_ERROR: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#;
+    const JSON_ERROR_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"method not found"}}"#;
+    const JSON_FOREIGN_ERROR: &str = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"method not found"}}"#;
+    const JSON_NOTIFICATION: &str = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
+    const JSON_PING_REQUEST: &str = r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#;
     const NEGOTIATED_VERSION: &str = "2025-03-26";
     const OLD_BEARER: &str = "Bearer old-token";
     const NEW_BEARER: &str = "Bearer new-token";
@@ -594,6 +640,42 @@ mod tests {
             .parse_rpc_response(NULL_ID_ERROR_EVENT, true, REQUEST_ID)
             .unwrap_err();
         assert!(matches!(err, McpError::RpcError { code: -32700, .. }));
+    }
+
+    enum Expected {
+        Ok(Value),
+        Invalid,
+        Rpc(i64),
+    }
+
+    #[test_case(&rpc_ok(7),                                          Expected::Ok(json!({"ok": true})) ; "matching_id_result")]
+    #[test_case(JSON_NULL_ID_ERROR,                                  Expected::Rpc(-32700)             ; "null_id_error_accepted")]
+    #[test_case(JSON_ERROR_RESPONSE,                                 Expected::Rpc(-32601)             ; "matching_id_error")]
+    #[test_case(JSON_FOREIGN_ERROR,                                  Expected::Invalid                 ; "foreign_id_error_rejected")]
+    #[test_case(JSON_NOTIFICATION,                                   Expected::Invalid                 ; "notification_rejected")]
+    #[test_case("not json",                                          Expected::Invalid                 ; "malformed_rejected")]
+    #[test_case(&format!("[{JSON_NOTIFICATION},{}]", rpc_ok(7)),     Expected::Ok(json!({"ok": true})) ; "batch_skips_leading_notification")]
+    #[test_case(&format!("[{JSON_PING_REQUEST},{}]", rpc_ok(7)),     Expected::Ok(json!({"ok": true})) ; "batch_skips_ping_request")]
+    #[test_case(&format!("[{},{}]", rpc_ok(3), rpc_ok(7)),           Expected::Ok(json!({"ok": true})) ; "batch_skips_stale_ids")]
+    #[test_case(&format!("[{JSON_NOTIFICATION}]"),                   Expected::Invalid                 ; "batch_notification_only_rejected")]
+    #[test_case(&format!("[{JSON_FOREIGN_ERROR},{}]", rpc_ok(7)),    Expected::Ok(json!({"ok": true})) ; "batch_foreign_error_skipped")]
+    #[test_case(&format!("[{JSON_NULL_ID_ERROR},{}]", rpc_ok(7)),    Expected::Rpc(-32700)             ; "batch_null_id_error_wins")]
+    #[test_case("[]",                                                Expected::Invalid                 ; "batch_empty_rejected")]
+    fn json_response_matching(body: &str, expected: Expected) {
+        let transport = transport_with("http://127.0.0.1:1/mcp", HashMap::new(), None);
+        let result = transport.parse_rpc_response(body, false, REQUEST_ID);
+
+        match expected {
+            Expected::Ok(value) => assert_eq!(result.unwrap(), value),
+            Expected::Invalid => assert!(matches!(
+                result.unwrap_err(),
+                McpError::InvalidResponse { .. }
+            )),
+            Expected::Rpc(code) => assert!(matches!(
+                result.unwrap_err(),
+                McpError::RpcError { code: c, .. } if c == code
+            )),
+        }
     }
 
     #[test]
